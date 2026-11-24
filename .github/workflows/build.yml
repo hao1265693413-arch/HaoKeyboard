@@ -1,0 +1,90 @@
+name: build-ipa
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld zip unzip make git libplist-dev libssl-dev libxml2-dev pkg-config
+
+      - name: Fetch iOS SDK
+        run: |
+          git clone --depth 1 https://github.com/theos/sdks.git sdks
+          ls sdks | head
+
+      - name: Build ldid (optional)
+        continue-on-error: true
+        run: |
+          git clone --depth 1 https://github.com/ProcursusTeam/ldid.git ldid-src
+          cd ldid-src
+          if [ -f Makefile ]; then make -j$(nproc); else
+            cmake -B build . && cmake --build build -j$(nproc) && cp build/ldid .
+          fi
+          cp ldid ../ldid && chmod +x ../ldid && ../ldid -h | head -3
+
+      - name: Compile
+        run: |
+          set -e
+          SDK=$(ls -d sdks/iPhoneOS*.sdk | sort -V | tail -1)
+          echo "SDK=$SDK"
+          mkdir -p build
+          FLAGS="-target arm64-apple-ios15.0 -isysroot $SDK -fobjc-arc -O2 -Wall
+                 -Wno-unused-variable -Wno-unused-parameter -Wno-deprecated-declarations
+                 -IKeyboard -IApp"
+          clang $FLAGS -c App/main.m -o build/main.o
+          clang $FLAGS -c App/AppDelegate.m -o build/AppDelegate.o
+          clang -target arm64-apple-ios15.0 -isysroot "$SDK" \
+            build/main.o build/AppDelegate.o -o build/HaoKeyboard \
+            -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -fuse-ld=lld
+
+          clang $FLAGS -c Keyboard/KeyboardViewController.m -o build/kvc.o
+          clang $FLAGS -c Keyboard/KeyboardView.m -o build/kv.o
+          clang $FLAGS -c Keyboard/KeyButton.m -o build/kb.o
+          clang -target arm64-apple-ios15.0 -isysroot "$SDK" \
+            build/kvc.o build/kv.o build/kb.o -o build/HaoKeyboardExtension \
+            -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
+            -Wl,-e,_NSExtensionMain -fuse-ld=lld
+
+          file build/HaoKeyboard build/HaoKeyboardExtension
+
+      - name: Package IPA
+        run: |
+          set -e
+          APP=Payload/HaoKeyboard.app
+          EXT="$APP/PlugIns/HaoKeyboardExtension.appex"
+          rm -rf Payload && mkdir -p "$EXT"
+
+          cp build/HaoKeyboard "$APP/HaoKeyboard"
+          cp App/Info.plist "$APP/Info.plist"
+          cp App/icons/*.png "$APP/"
+          printf 'APPL????' > "$APP/PkgInfo"
+
+          cp build/HaoKeyboardExtension "$EXT/HaoKeyboardExtension"
+          cp Keyboard/Info.plist "$EXT/Info.plist"
+          printf 'XPC!????' > "$EXT/PkgInfo"
+
+          chmod +x "$APP/HaoKeyboard" "$EXT/HaoKeyboardExtension"
+
+          if [ -x ./ldid ]; then
+            ./ldid -S "$APP/HaoKeyboard" || true
+            ./ldid -S "$EXT/HaoKeyboardExtension" || true
+          fi
+
+          zip -qry HaoKeyboard.ipa Payload
+          ls -lh HaoKeyboard.ipa
+          unzip -l HaoKeyboard.ipa | head -30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HaoKeyboard-ipa
+          path: HaoKeyboard.ipa
+          retention-days: 30
